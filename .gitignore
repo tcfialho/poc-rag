@@ -1,0 +1,6 @@
+faiss_document_store.db
+faiss_index/
+
+# Python
+__pycache__/
+.venv/

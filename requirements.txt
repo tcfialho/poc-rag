@@ -1,0 +1,9 @@
+farm-haystack==1.23.0
+SQLAlchemy>=1.4,<2
+sentence-transformers==2.2.2
+faiss-cpu==1.7.4
+numpy<2.0
+huggingface_hub<0.25
+openai>=1.0.0
+anthropic>=0.8.0
+google-generativeai>=0.3.0
