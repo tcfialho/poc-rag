@@ -37,24 +37,20 @@ CHUNK_SIZE = 500
 CHROMA_PATH = "./chroma_db"
 
 class ConversationTracker:
-    """Mantém as últimas *n* interações usuário-assistente."""
-    def __init__(self, max_history: int = 5) -> None:
-        self.history: List[Dict[str, str]] = []
+    """Mantém as últimas *n* interações usuário-assistente como ChatMessages."""
+    def __init__(self, max_history: int = 10) -> None:
+        self.history: List[ChatMessage] = []
         self.max_history = max_history
         self.session_id = str(uuid.uuid4())
 
     def add(self, query: str, response: str) -> None:
-        self.history.append({"query": query, "response": response})
-        if len(self.history) > self.max_history:
-            self.history = self.history[-self.max_history:]
+        self.history.append(ChatMessage.from_user(query))
+        self.history.append(ChatMessage.from_assistant(response))
+        if len(self.history) > self.max_history * 2:  # *2 pois cada interação tem user + assistant
+            self.history = self.history[-self.max_history * 2:]
 
-    def formatted_history(self) -> str:
-        if not self.history:
-            return "Nenhum histórico de conversa ainda."
-        return "\n".join(
-            f"Pergunta anterior: {h['query']}\nResposta anterior: {h['response']}"
-            for h in self.history
-        )
+    def formatted_history(self) -> List[ChatMessage]:
+        return self.history
 
 def index_document_if_needed(document_store: ChromaDocumentStore, rebuild: bool):
     """Verifica se o DocumentStore está vazio e o indexa se necessário, ou força rebuild se especificado, ingerindo arquivos de 'ks/'."""
@@ -99,7 +95,9 @@ def build_rag_pipeline(document_store: ChromaDocumentStore, model_name: str) -> 
     {% endfor %}
 
     Histórico da conversa:
-    {{ history }}
+    {% for message in history %}
+        {{ message.content }}
+    {% endfor %}
 
     Pergunta atual: {{ query }}
     Resposta:
@@ -136,7 +134,7 @@ def main() -> None:
     index_document_if_needed(document_store, args.rebuild_index)
 
     rag_pipeline = build_rag_pipeline(document_store, args.model)
-    conversation = ConversationTracker(max_history=3)
+    conversation = ConversationTracker(max_history=10)
 
     print("-" * 50)
     print(f"ID da Sessão: {conversation.session_id}")
