@@ -1,44 +1,47 @@
 #!/usr/bin/env python3
 """
-Pipeline RAG on-premises
-------------------------
-• Cria ou carrega um índice FAISS persistente  
-• Indexa um .txt/.md em chunks + embeddings (Sentence-Transformers)  
-• Usa um PromptNode (OpenAI, Claude ou Gemini) para gerar as respostas  
-• Mantém histórico curto de conversa entre perguntas
+Pipeline RAG on-premises com Haystack 2.0
+--------------------------------------------
+• Usa ChromaDocumentStore para armazenamento vetorial persistente.
+• Indexa um .txt/.md em chunks + embeddings (Sentence-Transformers).
+• Usa OpenRouterChatGenerator para gerar as respostas.
+• Mantém histórico curto de conversa entre perguntas.
 
-Estrutura principal
-1. Parser / paths e constantes                          
-2. Carregar ou criar o FAISSDocumentStore               
-3. Instanciar o EmbeddingRetriever    
-4. Atualizar embeddings se índice for novo              
-5. Construir o pipeline (Retriever → Generator)         
-6. Loop de interação com histórico                      
+Estrutura principal:
+1.  Paths e constantes.
+2.  Inicialização do Document Store e do Embedder.
+3.  Lógica para indexar o documento (se necessário).
+4.  Construção do pipeline RAG com componentes.
+5.  Loop de interação com histórico.
 """
-
-import argparse
 import os
+import argparse
 import uuid
-from typing import List, Dict, Tuple
-
-from haystack.document_stores import FAISSDocumentStore
-from haystack.nodes import EmbeddingRetriever, PromptNode
-from haystack.pipelines import Pipeline
-from haystack.schema import Document
+import shutil
+from pathlib import Path
+from typing import List, Dict
+from haystack import Pipeline
+from haystack.components.builders import ChatPromptBuilder
+from haystack.components.embedders import SentenceTransformersDocumentEmbedder, SentenceTransformersTextEmbedder
+from haystack.dataclasses import ChatMessage, Document
+from haystack.utils import Secret
+from haystack.document_stores.types import DuplicatePolicy
+from haystack_integrations.document_stores.chroma import ChromaDocumentStore
+from haystack_integrations.components.retrievers.chroma import ChromaEmbeddingRetriever
+from haystack_integrations.components.generators.openrouter import OpenRouterChatGenerator
+import glob
 
 # Constantes de configuração
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-EMBEDDING_DIM   = 384
-CHUNK_SIZE      = 500
-SQL_URL         = "sqlite:///faiss_document_store.db"
-
+CHUNK_SIZE = 500
+CHROMA_PATH = "./chroma_db"
 
 class ConversationTracker:
     """Mantém as últimas *n* interações usuário-assistente."""
     def __init__(self, max_history: int = 5) -> None:
         self.history: List[Dict[str, str]] = []
         self.max_history = max_history
-        self.session_id  = str(uuid.uuid4())
+        self.session_id = str(uuid.uuid4())
 
     def add(self, query: str, response: str) -> None:
         self.history.append({"query": query, "response": response})
@@ -47,161 +50,116 @@ class ConversationTracker:
 
     def formatted_history(self) -> str:
         if not self.history:
-            return ""
+            return "Nenhum histórico de conversa ainda."
         return "\n".join(
             f"Pergunta anterior: {h['query']}\nResposta anterior: {h['response']}"
             for h in self.history
         )
 
+def index_document_if_needed(document_store: ChromaDocumentStore, rebuild: bool):
+    """Verifica se o DocumentStore está vazio e o indexa se necessário, ou força rebuild se especificado, ingerindo arquivos de 'ks/'."""
+    ks_dir = "ks"
 
-def get_prompt_node(provider: str) -> PromptNode:
-    """Factory simples para PromptNodes (OpenAI, Claude ou Gemini)."""
-    tmpl = """
-Com base no contexto e no histórico abaixo, responda à pergunta atual.
-Se faltar informação, diga que não há dados suficientes.
-Contexto: {documents}
+    if rebuild or document_store.count_documents() == 0:
+        if not os.path.exists(ks_dir):
+            print(f"Pasta '{ks_dir}' não existe. Crie-a e adicione arquivos .txt ou .md.")
+            return
 
-{query}
+        file_paths = glob.glob(os.path.join(ks_dir, '*.txt')) + glob.glob(os.path.join(ks_dir, '*.md'))
+        if not file_paths:
+            print(f"Nenhum arquivo .txt ou .md encontrado em '{ks_dir}'. Pulando a indexação.")
+            return
 
-Resposta:"""
+        print(f"Indexando {len(file_paths)} arquivos de '{ks_dir}'...")
+        all_docs = []
+        for file_path in file_paths:
+            with open(file_path, encoding="utf-8") as f:
+                text = f.read()
+            chunks = [text[i: i + CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)]
+            docs = [Document(content=c, meta={"source": file_path}) for c in chunks]
+            all_docs.extend(docs)
 
-    provider = provider.lower()
-    key_env  = {
-        "openai": "OPENAI_API_KEY",
-        "claude": "CLAUDE_API_KEY",
-        "gemini": "GEMINI_API_KEY",
-    }.get(provider)
+        embedder = SentenceTransformersDocumentEmbedder(model=EMBEDDING_MODEL)
+        embedder.warm_up()
+        embedded_docs = embedder.run(documents=all_docs)["documents"]
 
-    if not key_env:
-        raise ValueError(f"Provedor '{provider}' não suportado.")
+        document_store.write_documents(embedded_docs, policy=DuplicatePolicy.OVERWRITE)
+        print(f"Documentos indexados: {document_store.count_documents()}")
+    else:
+        print(f"DocumentStore já contém {document_store.count_documents()} documentos. Pulando a indexação.")
 
-    return PromptNode(
-        model_name_or_path={"openai": "gpt-4.1-nano",
-                            "claude": "claude",
-                            "gemini": "gemini"}[provider],
-        api_key=os.getenv(key_env),
-        default_prompt_template=tmpl,
-        use_gpu=False,
-    )
+def build_rag_pipeline(document_store: ChromaDocumentStore, model_name: str) -> Pipeline:
+    prompt_template = [ChatMessage.from_system("""
+    Com base no contexto dos documentos e no histórico da conversa abaixo, responda à pergunta atual.
+    Se a informação não estiver no contexto, diga que não há dados suficientes para responder.
 
+    Contexto dos documentos:
+    {% for doc in documents %}
+        {{ doc.content }}
+    {% endfor %}
 
-def load_or_create_document_store(doc_path: str, persist_dir: str
-                                  ) -> Tuple[FAISSDocumentStore, bool]:
-    """Carrega índice se existir; senão cria, indexa e retorna flag `novo`."""
-    os.makedirs(persist_dir, exist_ok=True)
-    index_path  = os.path.join(persist_dir, "faiss_index.faiss")
-    config_path = os.path.join(persist_dir, "faiss_index.json")
+    Histórico da conversa:
+    {{ history }}
 
-    if os.path.exists(index_path) and os.path.exists(config_path):
-        try:
-            store = FAISSDocumentStore.load(index_path=index_path,
-                                            config_path=config_path)
-            return store, False
-        except ValueError:
-            # ín-matching dimensional ou corrupção → recria
-            for f in (index_path, config_path, SQL_URL.split("///")[-1]):
-                if os.path.exists(f):
-                    os.remove(f)
+    Pergunta atual: {{ query }}
+    Resposta:
+    """)]
 
-    # --- Criar novo índice ---
-    store = FAISSDocumentStore(
-        faiss_index_factory_str="Flat",
-        embedding_dim=EMBEDDING_DIM,
-        sql_url=SQL_URL,
-        return_embedding=True,
-        duplicate_documents="skip",
-        similarity="dot_product"
-    )
+    text_embedder = SentenceTransformersTextEmbedder(model=EMBEDDING_MODEL)
+    retriever = ChromaEmbeddingRetriever(document_store=document_store, top_k=2)
+    prompt_builder = ChatPromptBuilder(template=prompt_template, required_variables=["documents", "history", "query"])
+    llm = OpenRouterChatGenerator(model=model_name)
 
-    # Lê arquivo e quebra em chunks
-    with open(doc_path, encoding="utf-8") as f:
-        text = f.read()
+    rag_pipeline = Pipeline()
+    rag_pipeline.add_component("text_embedder", text_embedder)
+    rag_pipeline.add_component("retriever", retriever)
+    rag_pipeline.add_component("prompt_builder", prompt_builder)
+    rag_pipeline.add_component("llm", llm)
 
-    chunks = [text[i: i + CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)]
-    docs   = [Document(content=c,
-                       meta={"source": doc_path, "name": f"chunk_{i}"})
-              for i, c in enumerate(chunks)]
-    store.write_documents(docs)
-    return store, True
+    rag_pipeline.connect("text_embedder.embedding", "retriever.query_embedding")
+    rag_pipeline.connect("retriever.documents", "prompt_builder.documents")
+    rag_pipeline.connect("prompt_builder.prompt", "llm.messages")
 
-
-def create_retriever(store: FAISSDocumentStore) -> EmbeddingRetriever:
-    """Retorna o EmbeddingRetriever (instanciado apenas uma vez)."""
-    return EmbeddingRetriever(
-        document_store=store,
-        embedding_model=EMBEDDING_MODEL,
-        use_gpu=False,
-        top_k=1
-    )
-
-def update_and_save_index(store: FAISSDocumentStore,
-                          retriever: EmbeddingRetriever,
-                          persist_dir: str) -> None:
-    """Gera/atualiza embeddings e persiste índice FAISS + json config."""
-    index_path  = os.path.join(persist_dir, "faiss_index.faiss")
-    config_path = os.path.join(persist_dir, "faiss_index.json")
-    store.update_embeddings(retriever, update_existing_embeddings=True)
-    store.save(index_path=index_path, config_path=config_path)
-
-def build_pipeline(retriever: EmbeddingRetriever,
-                   prompt_node: PromptNode) -> Pipeline:
-    pipe = Pipeline()
-    pipe.add_node(retriever, name="Retriever", inputs=["Query"])
-    pipe.add_node(prompt_node, name=" or", inputs=["Retriever"])
-    return pipe
+    return rag_pipeline
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Pipeline RAG simples usando FAISS + Sentence-Transformers."
-    )
-    parser.add_argument("--provider", type=str, required=True,
-                        choices=["openai", "claude", "gemini"],
-                        help="LLM backend (openai, claude, gemini)")
-    parser.add_argument("--doc_path", type=str, required=True,
-                        help="Caminho para arquivo .txt ou .md a indexar")
+    parser = argparse.ArgumentParser(description="Pipeline RAG com Haystack 2.0, Chroma e OpenRouter.")
+    parser.add_argument("--model", type=str, default="deepseek/deepseek-chat", help="Nome do modelo OpenRouter a ser usado.")
+    parser.add_argument("--rebuild-index", action="store_true", help="Força a recriação do índice de documentos, deletando e reindexando.")
     args = parser.parse_args()
 
-    if not (os.path.isfile(args.doc_path)
-            and args.doc_path.lower().endswith((".txt", ".md"))):
-        raise ValueError("doc_path deve apontar para arquivo .txt ou .md existente.")
+    if args.rebuild_index and os.path.exists(CHROMA_PATH):
+        print("Limpando o banco de dados Chroma existente para recriação...")
+        shutil.rmtree(CHROMA_PATH)
 
-    persist_dir = "faiss_index"
+    document_store = ChromaDocumentStore(persist_path=CHROMA_PATH)
+    index_document_if_needed(document_store, args.rebuild_index)
 
-    # 2. Carregar ou criar índice
-    document_store, novo_indice = load_or_create_document_store(args.doc_path,
-                                                                persist_dir)
+    rag_pipeline = build_rag_pipeline(document_store, args.model)
+    conversation = ConversationTracker(max_history=3)
 
-    # 3. Retriever único
-    retriever = create_retriever(document_store)
-
-    # 4. Atualiza embeddings se índice recém-criado
-    if novo_indice:
-        update_and_save_index(document_store, retriever, persist_dir)
-
-    # 5. Pipeline + PromptNode
-    prompt_node  = get_prompt_node(args.provider)
-    pipe         = build_pipeline(retriever, prompt_node)
-    conversation = ConversationTracker(max_history=5)
-
+    print("-" * 50)
     print(f"ID da Sessão: {conversation.session_id}")
-    print("Digite sua pergunta (ou 'sair' para encerrar).")
+    print("Pipeline RAG pronto. Digite sua pergunta ou 'sair' para encerrar.")
+    print("-" * 50)
 
-    # 6. Loop de interação
     while True:
         user_q = input("\nPergunta: ").strip()
         if user_q.lower() == "sair":
             break
 
-        history   = conversation.formatted_history()
-        full_q    = (f"Histórico da conversa:\n{history}\n\nPergunta atual: {user_q}"
-                     if history else user_q)
+        history = conversation.formatted_history()
 
-        result    = pipe.run(query=full_q)
-        answer    = result.get("results", ["Não foi possível gerar resposta."])[0]
+        result = rag_pipeline.run(data={
+            "text_embedder": {"text": user_q},
+            "prompt_builder": {"query": user_q, "history": history}
+        })
 
+        answer = result["llm"]["replies"][0].text
         print("\nResposta:", answer)
         conversation.add(user_q, answer)
 
-
 if __name__ == "__main__":
+    if "OPENROUTER_API_KEY" not in os.environ:
+        raise ValueError("Por favor, defina a variável de ambiente OPENROUTER_API_KEY.")
     main()
