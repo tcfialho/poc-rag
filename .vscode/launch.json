@@ -6,8 +6,9 @@
       "type": "python",
       "request": "launch",
       "program": "${workspaceFolder}/rag.py",
-      "args": ["--provider", "openai", "--doc_path", "ks.txt"],
-      "console": "integratedTerminal"
+      "args": ["--doc_path", "ks.txt", "--openrouter-api-key", ""],
+      "console": "integratedTerminal",
+      "preLaunchTask": "install_dependencies"
     }
   ]
 }

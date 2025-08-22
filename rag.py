@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Pipeline RAG on-premises com Haystack 2.0
---------------------------------------------
+Pipeline RAG on-premises com Haystack 2.0 (usando OpenRouter)
+-------------------------------------------------------------
 • Usa ChromaDocumentStore para armazenamento vetorial persistente.
 • Indexa um .txt/.md em chunks + embeddings (Sentence-Transformers).
 • Usa OpenRouterChatGenerator para gerar as respostas.
@@ -52,7 +52,7 @@ class ConversationTracker:
     def formatted_history(self) -> List[ChatMessage]:
         return self.history
 
-def index_document_if_needed(document_store: ChromaDocumentStore, rebuild: bool):
+def index_document_if_needed(document_store: ChromaDocumentStore, document_embedder: SentenceTransformersDocumentEmbedder, rebuild: bool):
     """Verifica se o DocumentStore está vazio e o indexa se necessário, ou força rebuild se especificado, ingerindo arquivos de 'ks/'."""
     ks_dir = "ks"
 
@@ -75,16 +75,14 @@ def index_document_if_needed(document_store: ChromaDocumentStore, rebuild: bool)
             docs = [Document(content=c, meta={"source": file_path}) for c in chunks]
             all_docs.extend(docs)
 
-        embedder = SentenceTransformersDocumentEmbedder(model=EMBEDDING_MODEL)
-        embedder.warm_up()
-        embedded_docs = embedder.run(documents=all_docs)["documents"]
+        embedded_docs = document_embedder.run(documents=all_docs)["documents"]
 
         document_store.write_documents(embedded_docs, policy=DuplicatePolicy.OVERWRITE)
         print(f"Documentos indexados: {document_store.count_documents()}")
     else:
         print(f"DocumentStore já contém {document_store.count_documents()} documentos. Pulando a indexação.")
 
-def build_rag_pipeline(document_store: ChromaDocumentStore, model_name: str) -> Pipeline:
+def build_rag_pipeline(document_store: ChromaDocumentStore, text_embedder: SentenceTransformersTextEmbedder, model_name: str) -> Pipeline:
     prompt_template = [ChatMessage.from_system("""
     Com base no contexto dos documentos e no histórico da conversa abaixo, responda à pergunta atual.
     Se a informação não estiver no contexto, diga que não há dados suficientes para responder.
@@ -103,7 +101,6 @@ def build_rag_pipeline(document_store: ChromaDocumentStore, model_name: str) -> 
     Resposta:
     """)]
 
-    text_embedder = SentenceTransformersTextEmbedder(model=EMBEDDING_MODEL)
     retriever = ChromaEmbeddingRetriever(document_store=document_store, top_k=2)
     prompt_builder = ChatPromptBuilder(template=prompt_template, required_variables=["documents", "history", "query"])
     llm = OpenRouterChatGenerator(model=model_name)
@@ -124,16 +121,37 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Pipeline RAG com Haystack 2.0, Chroma e OpenRouter.")
     parser.add_argument("--model", type=str, default="deepseek/deepseek-chat", help="Nome do modelo OpenRouter a ser usado.")
     parser.add_argument("--rebuild-index", action="store_true", help="Força a recriação do índice de documentos, deletando e reindexando.")
+    parser.add_argument("--doc_path", type=str, default="ks.txt", help="Caminho para o documento a ser indexado.")
+    parser.add_argument("--openrouter-api-key", type=str, help="Sua chave de API OpenRouter (opcional).")
     args = parser.parse_args()
+
+    # Lógica para obter a OPENROUTER_API_KEY
+    openrouter_api_key = None
+    if args.openrouter_api_key:
+        openrouter_api_key = args.openrouter_api_key
+    elif "OPENROUTER_API_KEY" in os.environ:
+        openrouter_api_key = os.environ["OPENROUTER_API_KEY"]
+    else:
+        openrouter_api_key = input("Por favor, insira sua OPENROUTER_API_KEY: ").strip()
+        if not openrouter_api_key:
+            raise ValueError("OPENROUTER_API_KEY não pode ser vazia.")
+    os.environ["OPENROUTER_API_KEY"] = openrouter_api_key
 
     if args.rebuild_index and os.path.exists(CHROMA_PATH):
         print("Limpando o banco de dados Chroma existente para recriação...")
         shutil.rmtree(CHROMA_PATH)
 
     document_store = ChromaDocumentStore(persist_path=CHROMA_PATH)
-    index_document_if_needed(document_store, args.rebuild_index)
 
-    rag_pipeline = build_rag_pipeline(document_store, args.model)
+    # Inicializa e aquece os embedders uma única vez
+    document_embedder = SentenceTransformersDocumentEmbedder(model=EMBEDDING_MODEL)
+    document_embedder.warm_up()
+    text_embedder = SentenceTransformersTextEmbedder(model=EMBEDDING_MODEL)
+    text_embedder.warm_up()
+
+    index_document_if_needed(document_store, document_embedder, args.rebuild_index)
+
+    rag_pipeline = build_rag_pipeline(document_store, text_embedder, args.model)
     conversation = ConversationTracker(max_history=10)
 
     print("-" * 50)
@@ -158,6 +176,4 @@ def main() -> None:
         conversation.add(user_q, answer)
 
 if __name__ == "__main__":
-    if "OPENROUTER_API_KEY" not in os.environ:
-        raise ValueError("Por favor, defina a variável de ambiente OPENROUTER_API_KEY.")
     main()

@@ -3,3 +3,4 @@ python-dotenv
 chroma-haystack
 sentence-transformers
 openai
+openrouter-haystack
