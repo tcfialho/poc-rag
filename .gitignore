@@ -1,5 +1,5 @@
-faiss_document_store.db
-faiss_index/
+# Ignorar diretório do ChromaDB
+chroma_db/
 
 # Python
 __pycache__/
